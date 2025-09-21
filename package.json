@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "Baby-level Zadarma webhook → (optional) ATZ CRM",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
@@ -16,4 +15,3 @@
     "node": ">=18 <=22"
   }
 }
-
