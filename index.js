@@ -128,4 +128,149 @@ function pickOwnerId(internalExt) {
     const id = parseInt(ATZ_OWNER_MAP[internalExt], 10);
     if (Number.isFinite(id)) return id;
   }
-  if (Number.isFinite(AT
+  if (Number.isFinite(ATZ_OWNER_ID)) return ATZ_OWNER_ID;
+  return null;
+}
+
+async function atzCreateCandidate({ phone, ownerId, callId }) {
+  const last4 = (normPhone(phone).slice(-4) || "Lead");
+  const basePayload = {
+    first_name: "Caller",
+    last_name: last4,
+    phone: phone,
+    description: `Auto-created from Zadarma call ${callId}`
+  };
+
+  // Try with owner first
+  if (ownerId) {
+    try {
+      const resp = await atz.post("/candidate", { ...basePayload, owner_id: ownerId });
+      return resp.data;
+    } catch (e) {
+      const msg = e?.response?.data || e.message || e;
+      if (JSON.stringify(msg).includes("Invalid user for owner")) {
+        console.warn(`⚠️ owner_id ${ownerId} invalid — retrying without owner_id.`);
+      } else {
+        throw e;
+      }
+    }
+  }
+  // Fallback without owner
+  const resp2 = await atz.post("/candidate", basePayload);
+  return resp2.data;
+}
+
+async function atzGetOrCreateCandidateByPhone(phone, ownerId, callId) {
+  let cand = await atzFindCandidateByPhone(phone);
+  if (cand) return cand;
+  return atzCreateCandidate({ phone, ownerId, callId });
+}
+
+// Activity creation with FALLBACKS
+async function atzCreateCandidateActivityWithFallbacks(candidateId, call) {
+  // Build base activity payload
+  const baseActivity = {
+    type: "call",
+    subject: `Call ${call.direction}`,
+    notes: [
+      `Call ID: ${call.callId}`,
+      `From: ${call.from || "n/a"}`,
+      `To: ${call.to || "n/a"}`,
+      `Extension: ${call.internal || "n/a"}`,
+      `Duration: ${call.duration_seconds || 0}s`,
+      `Event: ${call.event}`,
+      call.disposition ? `Disposition: ${call.disposition}` : ""
+    ].filter(Boolean).join("\n"),
+    direction: call.direction || "unknown",
+    duration_seconds: call.duration_seconds || 0,
+    occurred_at: new Date().toISOString()
+  };
+
+  // Preferred path from env first, then smart fallbacks
+  const candidates = [];
+  if (ATZ_ACTIVITY_PATH) candidates.push(ATZ_ACTIVITY_PATH);
+
+  candidates.push(
+    "/candidate/{id}/activities",
+    "/candidate/{id}/notes",
+    "/candidate/{id}/note",
+    "/activities",
+    "/notes"
+  );
+
+  const tried = [];
+  for (const path of candidates) {
+    try {
+      if (path.includes("{id}")) {
+        const realPath = path.replace("{id}", String(candidateId));
+        tried.push(realPath);
+        const resp = await atz.post(realPath, baseActivity);
+        console.log(`✅ Activity created via path: ${realPath}`);
+        return resp.data;
+      } else {
+        // global endpoint, add candidate_id
+        tried.push(path);
+        const resp = await atz.post(path, { ...baseActivity, candidate_id: candidateId });
+        console.log(`✅ Activity created via path: ${path}`);
+        return resp.data;
+      }
+    } catch (e) {
+      const status = e?.response?.status;
+      const text = e?.response?.data || e.message || e;
+      if (status === 404) {
+        console.warn(`↪︎ Path not found, trying next: ${path}`);
+        continue; // try next candidate path
+      } else {
+        console.error(`❌ Activity path ${path} failed:`, text);
+        // non-404 might be permission/validation; try next anyway
+        continue;
+      }
+    }
+  }
+
+  console.error("❌ All activity paths failed. Tried:", tried);
+  return null;
+}
+
+// ------------------------------ webhook intake ------------------------------
+app.post("/zadarma", async (req, res) => {
+  res.json({ ok: true }); // reply fast
+
+  const body = Object.keys(req.body || {}).length ? req.body : (req.query || {});
+  const call = extractCall(body);
+  console.log("📞 Incoming Zadarma event:", call, "| raw keys:", Object.keys(body));
+
+  // Only act when the call is over (we have duration)
+  const ev = (call.event || "").toLowerCase();
+  const isEnd = ev.includes("end") || ev === "call_end" || ev.includes("finished");
+  if (!isEnd) return;
+
+  if (!ATZ_ENABLE || !ATZ_API_TOKEN) {
+    console.log("ℹ️ ATZ disabled or token missing — skipping candidate logging.");
+    return;
+  }
+
+  try {
+    // For matching, prefer the external party number
+    const phoneForMatch = call.direction === "outbound" ? call.to : call.from;
+    if (!phoneForMatch) {
+      console.warn("⚠️ No external phone to match; skipping ATZ upsert.");
+      return;
+    }
+
+    const ownerId = pickOwnerId(call.internal);
+    const candidate = await atzGetOrCreateCandidateByPhone(phoneForMatch, ownerId, call.callId);
+    const candId = candidate?.id || candidate?.slug || candidate?.uuid || null;
+    console.log("✅ Candidate upsert:", { candId, phone: phoneForMatch, usedOwnerId: ownerId });
+
+    if (candId) {
+      await atzCreateCandidateActivityWithFallbacks(candId, call);
+    }
+  } catch (e) {
+    console.error("❌ ATZ error:", e?.response?.data || e.message || e);
+  }
+});
+
+// ------------------------------ errors ------------------------------
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
