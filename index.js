@@ -1,4 +1,5 @@
-// index.js — Zadarma → Candidate upsert (no signature check, singular ATZ endpoints)
+// index.js — Zadarma → ATZ Candidate upsert (no signature check)
+// Adds: owner ID discovery + safe retry if owner invalid
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -6,7 +7,7 @@ const axios = require("axios");
 
 const app = express();
 
-// ---------- Step 1: trust proxy + capture RAW body (future-proof) ----------
+// ---------- trust proxy + capture RAW body ----------
 app.set("trust proxy", true);
 const rawSaver = (req, res, buf) => {
   try { req.rawBody = buf ? buf.toString("utf8") : ""; } catch { req.rawBody = ""; }
@@ -14,35 +15,26 @@ const rawSaver = (req, res, buf) => {
 app.use(bodyParser.json({ verify: rawSaver }));
 app.use(bodyParser.urlencoded({ extended: true, verify: rawSaver }));
 
-// ------------------------------ Config (ENV) ------------------------------
-// Works without these; ATZ actions only run if ATZ_API_TOKEN is set.
-const PORT             = process.env.PORT || 3000;
+// ------------------------------ ENV ------------------------------
+const PORT = process.env.PORT || 3000;
 
-// Turn ATZ integration on/off without code edits:
-const ATZ_ENABLE       = (process.env.ATZ_ENABLE || "1") === "1";
-// Your base URL (defaults to v1):
-const ATZ_BASE_URL     = process.env.ATZ_BASE_URL || "https://api.atzcrm.com/v1";
-// Token from ATZ Admin → API:
-const ATZ_API_TOKEN    = process.env.ATZ_API_TOKEN || process.env.ATZ_TOKEN || "";
-// Owner for new candidates (find your ID in ATZ; set env ATZ_OWNER_ID="123"):
-const ATZ_OWNER_ID     = parseInt(process.env.ATZ_OWNER_ID || "1", 10);
+// ATZ toggles/config
+const ATZ_ENABLE = (process.env.ATZ_ENABLE || "1") === "1";
+const ATZ_BASE_URL = process.env.ATZ_BASE_URL || "https://api.atzcrm.com/v1";
+const ATZ_API_TOKEN = process.env.ATZ_API_TOKEN || process.env.ATZ_TOKEN || "";
+const ATZ_OWNER_ID = parseInt(process.env.ATZ_OWNER_ID || "0", 10) || null; // your default owner
+const ATZ_OWNER_MAP = safeParseJSON(process.env.ATZ_OWNER_MAP || "{}"); // {"101":"123"}
+const ATZ_ACTIVITY_PATH = process.env.ATZ_ACTIVITY_PATH || ""; // e.g. "/candidate/{id}/activities"
+// Turn on once to dump user IDs to logs so you can pick the right owner_id
+const ATZ_LIST_USERS_ON_BOOT = (process.env.ATZ_LIST_USERS_ON_BOOT || "0") === "1";
 
-// OPTIONAL: if your ATZ supports a candidate activity endpoint, set e.g.
-// ATZ_ACTIVITY_PATH = "/candidate/{id}/activities"
-// We’ll replace {id} automatically with the candidate id.
-const ATZ_ACTIVITY_PATH = process.env.ATZ_ACTIVITY_PATH || "";
-
-// Map PBX extensions → ATZ user IDs (JSON), e.g. {"101":"123","102":"124"}
-let ATZ_OWNER_MAP = {};
-try { ATZ_OWNER_MAP = JSON.parse(process.env.ATZ_OWNER_MAP || "{}"); } catch { ATZ_OWNER_MAP = {}; }
-
-// ------------------------------ Startup logs ------------------------------
+// ------------------------------ startup logs ------------------------------
 console.log("Booting webhook…");
 console.log("PORT =", PORT);
 console.log("ATZ_ENABLE =", ATZ_ENABLE, "| ATZ_BASE_URL =", ATZ_BASE_URL);
-if (!ATZ_API_TOKEN && ATZ_ENABLE) console.warn("⚠️ ATZ_API_TOKEN not set; ATZ actions will be skipped.");
+if (ATZ_ENABLE && !ATZ_API_TOKEN) console.warn("⚠️ ATZ_API_TOKEN not set — ATZ calls will be skipped.");
 
-// ------------------------------ Health & echo ------------------------------
+// ------------------------------ health & echo ------------------------------
 app.get("/", (_, res) => res.status(200).send("Webhook is alive ✅"));
 
 app.get("/zadarma", (req, res) => {
@@ -51,34 +43,38 @@ app.get("/zadarma", (req, res) => {
   res.status(200).send("OK");
 });
 
-// ------------------------------ Helpers ------------------------------
-const atz = axios.create({
-  baseURL: ATZ_BASE_URL,
-  timeout: 15000,
-  headers: ATZ_API_TOKEN ? { Authorization: `Bearer ${ATZ_API_TOKEN}` } : {}
-});
-
+// ------------------------------ utils ------------------------------
+function safeParseJSON(s) {
+  try { return JSON.parse(s); } catch { return {}; }
+}
 const normPhone = (p) => (p || "").toString().replace(/[^\d+]/g, "");
 const toInt = (v, d = 0) => {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : d;
 };
 
-// Parse Zadarma-ish payloads defensively
+// Better direction detection for Zadarma NOTIFY_* patterns
+function guessDirection(payload) {
+  const event = (payload.event || "").toString().toUpperCase();
+  const hasInternal = !!(payload.internal || payload.extension);
+  const hasDest = !!(payload.destination);
+  const hasCalledDid = !!(payload.called_did);
+  // Heuristics tuned to your logs:
+  if (event.includes("OUT")) return "outbound";
+  if (event.includes("INTERNAL")) return "inbound"; // ringing to an internal ext from outside
+  if (event.includes("START") && hasCalledDid && !hasInternal) return "inbound";
+  if (event.includes("START") && hasInternal && hasDest) return "outbound";
+  return "unknown";
+}
+
 function extractCall(payload) {
   const event     = (payload.event || payload.Event || "").toString();
   const callId    = payload.pbx_call_id || payload.call_id || "";
   const from      = payload.caller_id || payload.caller || payload.from || payload.number_from || "";
   const to        = payload.destination || payload.called_did || payload.to || payload.number_to || "";
   const internal  = payload.internal || payload.extension || "";
-  const dirRaw    = (payload.call_type || payload.direction || "").toString().toLowerCase();
   const duration  = toInt(payload.duration || payload.billsec || payload.billing_seconds || 0, 0);
-
-  let direction = "unknown";
-  if (dirRaw.includes("in")) direction = "inbound";
-  else if (dirRaw.includes("out")) direction = "outbound";
-  else if (from && internal && !to) direction = "outbound";
-  else if (to && internal && !from) direction = "inbound";
+  const direction = guessDirection(payload);
 
   return {
     event,
@@ -91,15 +87,33 @@ function extractCall(payload) {
   };
 }
 
-// ------------------------------ ATZ: Candidate ------------------------------
-// ATZ uses SINGULAR endpoints: /v1/candidate (list/create).
-// We’ll do a small paged client-side search for a matching phone, then create if not found.
+// ------------------------------ ATZ client ------------------------------
+const atz = axios.create({
+  baseURL: ATZ_BASE_URL,
+  timeout: 15000,
+  headers: ATZ_API_TOKEN ? { Authorization: `Bearer ${ATZ_API_TOKEN}` } : {}
+});
 
+let ATZ_USERS_CACHE = null;
+
+async function loadAtzUsersIfWanted() {
+  if (!ATZ_ENABLE || !ATZ_API_TOKEN || !ATZ_LIST_USERS_ON_BOOT) return;
+  try {
+    const resp = await atz.get("/users");
+    const list = Array.isArray(resp.data) ? resp.data : (resp.data?.data || []);
+    ATZ_USERS_CACHE = list;
+    console.log("👥 ATZ users (id → name):");
+    list.forEach(u => console.log(`   ${u.id} → ${u.name || u.full_name || u.email || "(no name)"}`));
+    console.log("ℹ️ Use one of these IDs for ATZ_OWNER_ID or map in ATZ_OWNER_MAP like {\"101\":\"<id>\"}");
+  } catch (e) {
+    console.warn("⚠️ Could not list ATZ users:", e?.response?.data || e.message);
+  }
+}
+
+// list candidates (paged)
 async function atzListCandidatesPage(page = 1, limit = 50) {
   const resp = await atz.get("/candidate", { params: { page, limit } });
-  // Some APIs return {data: [...]}, others return array directly — handle both.
-  const data = Array.isArray(resp.data) ? resp.data : (resp.data?.data || []);
-  return data;
+  return Array.isArray(resp.data) ? resp.data : (resp.data?.data || []);
 }
 
 async function atzFindCandidateByPhone(phone) {
@@ -109,22 +123,49 @@ async function atzFindCandidateByPhone(phone) {
     const list = await atzListCandidatesPage(page, 50);
     const match = list.find(c => normPhone(c.phone) === target);
     if (match) return match;
-    if (list.length < 50) break; // no more pages
+    if (list.length < 50) break;
   }
+  return null;
+}
+
+function pickOwnerId(internalExt) {
+  // 1) mapped by extension
+  if (internalExt && ATZ_OWNER_MAP[internalExt]) {
+    const id = parseInt(ATZ_OWNER_MAP[internalExt], 10);
+    if (Number.isFinite(id)) return id;
+  }
+  // 2) fallback to global owner
+  if (Number.isFinite(ATZ_OWNER_ID)) return ATZ_OWNER_ID;
   return null;
 }
 
 async function atzCreateCandidate({ phone, ownerId, callId }) {
   const last4 = (normPhone(phone).slice(-4) || "Lead");
-  const body = {
+  const basePayload = {
     first_name: "Caller",
     last_name: last4,
     phone: phone,
-    owner_id: ownerId || ATZ_OWNER_ID,
     description: `Auto-created from Zadarma call ${callId}`
   };
-  const resp = await atz.post("/candidate", body);
-  return resp.data;
+
+  // Try WITH owner_id first if provided
+  if (ownerId) {
+    try {
+      const resp = await atz.post("/candidate", { ...basePayload, owner_id: ownerId });
+      return resp.data;
+    } catch (e) {
+      const msg = e?.response?.data || e.message || e;
+      // If ATZ complains about owner, retry without owner_id
+      if (JSON.stringify(msg).includes("Invalid user for owner")) {
+        console.warn(`⚠️ owner_id ${ownerId} invalid — retrying without owner_id.`);
+      } else {
+        throw e;
+      }
+    }
+  }
+  // Retry WITHOUT owner_id
+  const resp2 = await atz.post("/candidate", basePayload);
+  return resp2.data;
 }
 
 async function atzGetOrCreateCandidateByPhone(phone, ownerId, callId) {
@@ -133,7 +174,6 @@ async function atzGetOrCreateCandidateByPhone(phone, ownerId, callId) {
   return atzCreateCandidate({ phone, ownerId, callId });
 }
 
-// Optional activity creation if you set ATZ_ACTIVITY_PATH
 async function atzCreateCandidateActivity(candidateId, call) {
   if (!ATZ_ACTIVITY_PATH) {
     console.log("ℹ️ ATZ_ACTIVITY_PATH not set — skipping activity creation.");
@@ -159,19 +199,17 @@ async function atzCreateCandidateActivity(candidateId, call) {
   return resp.data;
 }
 
-// ------------------------------ Main webhook ------------------------------
+// ------------------------------ webhook intake ------------------------------
 app.post("/zadarma", async (req, res) => {
-  // reply immediately so Zadarma doesn’t retry
-  res.json({ ok: true });
+  res.json({ ok: true }); // reply fast
 
   const body = Object.keys(req.body || {}).length ? req.body : (req.query || {});
   const call = extractCall(body);
   console.log("📞 Incoming Zadarma event:", call, "| raw keys:", Object.keys(body));
 
-  // Only act on "end" events so we have final duration
+  // Only act when the call is over (we have duration)
   const ev = (call.event || "").toLowerCase();
   const isEnd = ev.includes("end") || ev === "call_end" || ev.includes("finished");
-
   if (!isEnd) return;
 
   if (!ATZ_ENABLE || !ATZ_API_TOKEN) {
@@ -180,34 +218,36 @@ app.post("/zadarma", async (req, res) => {
   }
 
   try {
-    // Prefer the external party number for matching:
+    // Use the external party number for matching
     const phoneForMatch = call.direction === "outbound" ? call.to : call.from;
     if (!phoneForMatch) {
-      console.warn("⚠️ No phone to match; skipping ATZ upsert.");
+      console.warn("⚠️ No external phone to match; skipping ATZ upsert.");
       return;
     }
 
-    // Owner mapping by PBX extension if provided
-    const ownerId = ATZ_OWNER_MAP[call.internal] ? parseInt(ATZ_OWNER_MAP[call.internal], 10) : ATZ_OWNER_ID;
+    // pick owner (may be null)
+    const ownerId = pickOwnerId(call.internal);
 
-    // Upsert Candidate
+    // upsert candidate
     const candidate = await atzGetOrCreateCandidateByPhone(phoneForMatch, ownerId, call.callId);
-    const candId = candidate?.id || candidate?.slug || candidate?.uuid;
-    console.log("✅ Candidate upsert:", { candId, phone: phoneForMatch });
+    const candId = candidate?.id || candidate?.slug || candidate?.uuid || null;
+    console.log("✅ Candidate upsert:", { candId, phone: phoneForMatch, usedOwnerId: ownerId });
 
-    // Optional: create a call activity if path configured
+    // optional activity
     if (candId && ATZ_ACTIVITY_PATH) {
       await atzCreateCandidateActivity(candId, call);
       console.log("✅ Logged call activity on candidate:", candId);
     }
   } catch (e) {
-    const respData = e?.response?.data || e?.message || e;
-    console.error("❌ ATZ error:", respData);
+    console.error("❌ ATZ error:", e?.response?.data || e.message || e);
   }
 });
 
-// ------------------------------ Errors & start ------------------------------
+// ------------------------------ errors & start ------------------------------
 process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
 
-app.listen(PORT, () => console.log(`🚀 Webhook listening on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`🚀 Webhook listening on port ${PORT}`);
+  await loadAtzUsersIfWanted(); // logs IDs if ATZ_LIST_USERS_ON_BOOT=1
+});
