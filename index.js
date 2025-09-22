@@ -3,6 +3,21 @@ const bodyParser = require("body-parser");
 const axios = require("axios");
 
 const app = express();
+// --- STEP 1: trust proxy + capture raw request body for signature checks ---
+app.set("trust proxy", true);
+
+const rawSaver = (req, res, buf) => {
+  try {
+    req.rawBody = buf ? buf.toString("utf8") : "";
+  } catch {
+    req.rawBody = "";
+  }
+};
+
+// IMPORTANT: use these parsers so raw body is preserved
+app.use(require("body-parser").json({ verify: rawSaver }));
+app.use(require("body-parser").urlencoded({ extended: true, verify: rawSaver }));
+
 
 // Helpful startup logs
 const PORT = process.env.PORT || 3000;
