@@ -1,4 +1,4 @@
-// index.js — Zadarma → Candidate upsert + call activity (no signature check)
+// index.js — Zadarma → Candidate upsert (no signature check, singular ATZ endpoints)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -6,7 +6,7 @@ const axios = require("axios");
 
 const app = express();
 
-// --- Keep proxy trust + raw body capture (future-proof) ---
+// ---------- Step 1: trust proxy + capture RAW body (future-proof) ----------
 app.set("trust proxy", true);
 const rawSaver = (req, res, buf) => {
   try { req.rawBody = buf ? buf.toString("utf8") : ""; } catch { req.rawBody = ""; }
@@ -14,66 +14,71 @@ const rawSaver = (req, res, buf) => {
 app.use(bodyParser.json({ verify: rawSaver }));
 app.use(bodyParser.urlencoded({ extended: true, verify: rawSaver }));
 
-// ================== CONFIG via Environment Variables ==================
-const PORT            = process.env.PORT || 3000;
+// ------------------------------ Config (ENV) ------------------------------
+// Works without these; ATZ actions only run if ATZ_API_TOKEN is set.
+const PORT             = process.env.PORT || 3000;
 
-// ATZ CRM config
-const ATZ_ENABLE      = (process.env.ATZ_ENABLE || "1") === "1"; // set to "0" to disable without code edits
-const ATZ_BASE_URL    = process.env.ATZ_BASE_URL || "https://api.atzcrm.com/v1"; // <-- CHANGE if your ATZ base differs
-const ATZ_TOKEN       = process.env.ATZ_TOKEN || ""; // required when ATZ_ENABLE=1
+// Turn ATZ integration on/off without code edits:
+const ATZ_ENABLE       = (process.env.ATZ_ENABLE || "1") === "1";
+// Your base URL (defaults to v1):
+const ATZ_BASE_URL     = process.env.ATZ_BASE_URL || "https://api.atzcrm.com/v1";
+// Token from ATZ Admin → API:
+const ATZ_API_TOKEN    = process.env.ATZ_API_TOKEN || process.env.ATZ_TOKEN || "";
+// Owner for new candidates (find your ID in ATZ; set env ATZ_OWNER_ID="123"):
+const ATZ_OWNER_ID     = parseInt(process.env.ATZ_OWNER_ID || "1", 10);
 
-// Optional: map PBX extensions to ATZ owner/user IDs
-// e.g., {"200":"123"} means extension 200 assigns owner_id 123 in ATZ
-const ATZ_OWNER_MAP   = JSON.parse(process.env.ATZ_OWNER_MAP || "{}");
+// OPTIONAL: if your ATZ supports a candidate activity endpoint, set e.g.
+// ATZ_ACTIVITY_PATH = "/candidate/{id}/activities"
+// We’ll replace {id} automatically with the candidate id.
+const ATZ_ACTIVITY_PATH = process.env.ATZ_ACTIVITY_PATH || "";
 
-// =====================================================================
+// Map PBX extensions → ATZ user IDs (JSON), e.g. {"101":"123","102":"124"}
+let ATZ_OWNER_MAP = {};
+try { ATZ_OWNER_MAP = JSON.parse(process.env.ATZ_OWNER_MAP || "{}"); } catch { ATZ_OWNER_MAP = {}; }
 
-// Health logs
+// ------------------------------ Startup logs ------------------------------
 console.log("Booting webhook…");
 console.log("PORT =", PORT);
 console.log("ATZ_ENABLE =", ATZ_ENABLE, "| ATZ_BASE_URL =", ATZ_BASE_URL);
+if (!ATZ_API_TOKEN && ATZ_ENABLE) console.warn("⚠️ ATZ_API_TOKEN not set; ATZ actions will be skipped.");
 
-// Health check
+// ------------------------------ Health & echo ------------------------------
 app.get("/", (_, res) => res.status(200).send("Webhook is alive ✅"));
 
-// Zadarma URL validation (GET ?zd_echo=...)
 app.get("/zadarma", (req, res) => {
   const echo = req.query.zd_echo;
   if (echo) return res.status(200).send(echo);
   res.status(200).send("OK");
 });
 
-// ------------------------- Helpers -------------------------
+// ------------------------------ Helpers ------------------------------
 const atz = axios.create({
   baseURL: ATZ_BASE_URL,
-  timeout: 10000,
-  headers: ATZ_TOKEN ? { Authorization: `Bearer ${ATZ_TOKEN}` } : {}
+  timeout: 15000,
+  headers: ATZ_API_TOKEN ? { Authorization: `Bearer ${ATZ_API_TOKEN}` } : {}
 });
 
 const normPhone = (p) => (p || "").toString().replace(/[^\d+]/g, "");
-const toInt = (v, def = 0) => {
+const toInt = (v, d = 0) => {
   const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : def;
+  return Number.isFinite(n) ? n : d;
 };
 
-// Very defensive extraction since payload keys vary by event
-function extractCallFields(payload) {
-  const event     = payload.event || payload.Event || payload.type || "";
-  const callId    = payload.call_id || payload.pbx_call_id || payload.CallID || "";
-  const from      = payload.caller_id || payload.caller || payload.from || payload.src || payload.number_from || "";
-  const to        = payload.destination || payload.called_did || payload.to || payload.dst || payload.number_to || "";
-  const internal  = payload.internal || payload.extension || payload.agent || payload.user || "";
+// Parse Zadarma-ish payloads defensively
+function extractCall(payload) {
+  const event     = (payload.event || payload.Event || "").toString();
+  const callId    = payload.pbx_call_id || payload.call_id || "";
+  const from      = payload.caller_id || payload.caller || payload.from || payload.number_from || "";
+  const to        = payload.destination || payload.called_did || payload.to || payload.number_to || "";
+  const internal  = payload.internal || payload.extension || "";
   const dirRaw    = (payload.call_type || payload.direction || "").toString().toLowerCase();
+  const duration  = toInt(payload.duration || payload.billsec || payload.billing_seconds || 0, 0);
 
-  // Direction heuristic
   let direction = "unknown";
   if (dirRaw.includes("in")) direction = "inbound";
   else if (dirRaw.includes("out")) direction = "outbound";
   else if (from && internal && !to) direction = "outbound";
   else if (to && internal && !from) direction = "inbound";
-
-  // Duration: Zadarma often gives seconds at end notifications
-  const dur = toInt(payload.duration || payload.billsec || payload.billing_seconds || payload.time || 0, 0);
 
   return {
     event,
@@ -82,119 +87,127 @@ function extractCallFields(payload) {
     to: normPhone(to),
     internal: (internal || "").toString(),
     direction,
-    duration_seconds: dur
+    duration_seconds: duration
   };
 }
 
-// -------------------- ATZ: Candidate + Activity --------------------
-// NOTE: Adjust these THREE marked blocks if your ATZ API differs.
-async function findOrCreateCandidateByPhone(phone, fallbackOwnerId, callId) {
+// ------------------------------ ATZ: Candidate ------------------------------
+// ATZ uses SINGULAR endpoints: /v1/candidate (list/create).
+// We’ll do a small paged client-side search for a matching phone, then create if not found.
+
+async function atzListCandidatesPage(page = 1, limit = 50) {
+  const resp = await atz.get("/candidate", { params: { page, limit } });
+  // Some APIs return {data: [...]}, others return array directly — handle both.
+  const data = Array.isArray(resp.data) ? resp.data : (resp.data?.data || []);
+  return data;
+}
+
+async function atzFindCandidateByPhone(phone) {
   if (!phone) return null;
-
-  // (1) SEARCH candidate by phone  <<< ADJUST if your API differs
-  // Some CRMs use a list endpoint with filters; others have a dedicated search.
-  // Replace with your real search endpoint/params.
-  try {
-    const search = await atz.get("/candidates", { params: { phone } });
-    if (Array.isArray(search.data) && search.data.length > 0) {
-      return search.data[0]; // assume first is best match
-    }
-  } catch (e) {
-    console.warn("ATZ search failed (will attempt create):", e?.response?.data || e.message);
+  const target = normPhone(phone);
+  for (let page = 1; page <= 3; page++) {
+    const list = await atzListCandidatesPage(page, 50);
+    const match = list.find(c => normPhone(c.phone) === target);
+    if (match) return match;
+    if (list.length < 50) break; // no more pages
   }
-
-  // (2) CREATE candidate if not found  <<< ADJUST fields for your ATZ schema
-  try {
-    const create = await atz.post("/candidates", {
-      first_name: "Auto",
-      last_name: phone,
-      phone,
-      owner_id: fallbackOwnerId || undefined,
-      description: `Auto-created from Zadarma call ${callId}`
-    });
-    return create.data;
-  } catch (e) {
-    console.error("ATZ create candidate failed:", e?.response?.data || e.message);
-    return null;
-  }
+  return null;
 }
 
-async function createCandidateCallActivity(candidateId, data) {
-  if (!candidateId) return;
-
-  // (3) CREATE activity on candidate  <<< ADJUST endpoint + fields for your ATZ
-  // Many CRMs accept something like /candidates/{id}/activities or a generic /activities with candidate_id.
-  try {
-    await atz.post(`/candidates/${candidateId}/activities`, {
-      type: "call",
-      subject: `Call ${data.direction || "call"}`,
-      notes: [
-        `Call ID: ${data.callId}`,
-        `From: ${data.from || "n/a"}`,
-        `To: ${data.to || "n/a"}`,
-        `Extension: ${data.internal || "n/a"}`,
-        `Duration: ${data.duration_seconds || 0}s`,
-        `Event: ${data.event}`
-      ].join("\n"),
-      direction: data.direction || "unknown",
-      duration_seconds: data.duration_seconds || 0,
-      occurred_at: new Date().toISOString()
-    });
-  } catch (e) {
-    console.error("ATZ create activity failed:", e?.response?.data || e.message);
-  }
+async function atzCreateCandidate({ phone, ownerId, callId }) {
+  const last4 = (normPhone(phone).slice(-4) || "Lead");
+  const body = {
+    first_name: "Caller",
+    last_name: last4,
+    phone: phone,
+    owner_id: ownerId || ATZ_OWNER_ID,
+    description: `Auto-created from Zadarma call ${callId}`
+  };
+  const resp = await atz.post("/candidate", body);
+  return resp.data;
 }
 
-// ------------------------- Main Intake -------------------------
+async function atzGetOrCreateCandidateByPhone(phone, ownerId, callId) {
+  let cand = await atzFindCandidateByPhone(phone);
+  if (cand) return cand;
+  return atzCreateCandidate({ phone, ownerId, callId });
+}
+
+// Optional activity creation if you set ATZ_ACTIVITY_PATH
+async function atzCreateCandidateActivity(candidateId, call) {
+  if (!ATZ_ACTIVITY_PATH) {
+    console.log("ℹ️ ATZ_ACTIVITY_PATH not set — skipping activity creation.");
+    return;
+  }
+  const path = ATZ_ACTIVITY_PATH.replace("{id}", String(candidateId));
+  const payload = {
+    type: "call",
+    subject: `Call ${call.direction}`,
+    notes: [
+      `Call ID: ${call.callId}`,
+      `From: ${call.from || "n/a"}`,
+      `To: ${call.to || "n/a"}`,
+      `Extension: ${call.internal || "n/a"}`,
+      `Duration: ${call.duration_seconds || 0}s`,
+      `Event: ${call.event}`
+    ].join("\n"),
+    direction: call.direction || "unknown",
+    duration_seconds: call.duration_seconds || 0,
+    occurred_at: new Date().toISOString()
+  };
+  const resp = await atz.post(path, payload);
+  return resp.data;
+}
+
+// ------------------------------ Main webhook ------------------------------
 app.post("/zadarma", async (req, res) => {
-  // Always respond quickly so Zadarma doesn't retry
+  // reply immediately so Zadarma doesn’t retry
   res.json({ ok: true });
 
-  // Build payload
   const body = Object.keys(req.body || {}).length ? req.body : (req.query || {});
-  const call = extractCallFields(body);
+  const call = extractCall(body);
   console.log("📞 Incoming Zadarma event:", call, "| raw keys:", Object.keys(body));
 
-  // Only log to ATZ on "end" type events so we have final duration
-  // Depending on account, end events may be NOTIFY_END / NOTIFY_OUT_END / call_end, etc.
+  // Only act on "end" events so we have final duration
   const ev = (call.event || "").toLowerCase();
-  const looksLikeEnd =
-    ev.includes("end") || ev.includes("finished") || ev === "call_end";
+  const isEnd = ev.includes("end") || ev === "call_end" || ev.includes("finished");
 
-  if (!ATZ_ENABLE || !ATZ_TOKEN) {
-    if (looksLikeEnd) {
-      console.log("ℹ️ ATZ disabled or token missing—skipping candidate logging.");
-    }
+  if (!isEnd) return;
+
+  if (!ATZ_ENABLE || !ATZ_API_TOKEN) {
+    console.log("ℹ️ ATZ disabled or token missing — skipping candidate logging.");
     return;
   }
 
-  if (looksLikeEnd) {
-    try {
-      // Choose the phone we’ll use to match: prefer external party
-      const phoneForMatch = call.direction === "outbound" ? call.to : call.from;
-
-      // Decide owner by extension, if mapped
-      const ownerId = ATZ_OWNER_MAP[call.internal] || undefined;
-
-      // Upsert candidate
-      const candidate = await findOrCreateCandidateByPhone(phoneForMatch, ownerId, call.callId);
-      if (!candidate || !candidate.id) {
-        console.warn("⚠️ Could not get/create candidate for phone:", phoneForMatch);
-        return;
-      }
-
-      // Create activity
-      await createCandidateCallActivity(candidate.id, call);
-      console.log(`✅ Logged call on candidate ${candidate.id} (${phoneForMatch})`);
-    } catch (e) {
-      console.error("❌ ATZ upsert/log failed:", e?.response?.data || e.message);
+  try {
+    // Prefer the external party number for matching:
+    const phoneForMatch = call.direction === "outbound" ? call.to : call.from;
+    if (!phoneForMatch) {
+      console.warn("⚠️ No phone to match; skipping ATZ upsert.");
+      return;
     }
+
+    // Owner mapping by PBX extension if provided
+    const ownerId = ATZ_OWNER_MAP[call.internal] ? parseInt(ATZ_OWNER_MAP[call.internal], 10) : ATZ_OWNER_ID;
+
+    // Upsert Candidate
+    const candidate = await atzGetOrCreateCandidateByPhone(phoneForMatch, ownerId, call.callId);
+    const candId = candidate?.id || candidate?.slug || candidate?.uuid;
+    console.log("✅ Candidate upsert:", { candId, phone: phoneForMatch });
+
+    // Optional: create a call activity if path configured
+    if (candId && ATZ_ACTIVITY_PATH) {
+      await atzCreateCandidateActivity(candId, call);
+      console.log("✅ Logged call activity on candidate:", candId);
+    }
+  } catch (e) {
+    const respData = e?.response?.data || e?.message || e;
+    console.error("❌ ATZ error:", respData);
   }
 });
 
-// Error visibility
+// ------------------------------ Errors & start ------------------------------
 process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
 
-// Start server
 app.listen(PORT, () => console.log(`🚀 Webhook listening on port ${PORT}`));
